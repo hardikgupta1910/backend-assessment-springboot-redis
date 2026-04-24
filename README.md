@@ -1,152 +1,238 @@
 # Backend Assessment - Spring Boot Redis Guardrail Service
 
-This project is a Spring Boot microservice built for the Backend Engineering Assignment. It acts as the central API layer and guardrail system for posts, comments, likes, Redis-based virality tracking, concurrency-safe bot guardrails, and notification batching .
+This project is a Spring Boot microservice built for the Backend Engineering Assignment.
+It acts as the central API layer and guardrail system for posts, comments, likes, Redis-based virality tracking, concurrency-safe bot limits, and notification batching.
+
+---
 
 ## Tech Stack
 
-- Java 17+
-- Spring Boot 3.x
-- PostgreSQL
-- Redis
-- Docker Compose 
+* Java 17+
+* Spring Boot 3.x
+* PostgreSQL
+* Redis
+* Docker Compose
+
+---
 
 ## Approach
 
-The application is designed with PostgreSQL as the persistent source of truth and Redis as the real-time guardrail layer.
-PostgreSQL stores actual entities such as posts and comments, while Redis handles fast-changing distributed state like virality score, bot reply counters, cooldown keys, and pending notifications.
+The system follows a clear separation of responsibilities:
 
-The main idea is simple:
-- Persist actual business data in PostgreSQL.
-- Enforce concurrency-sensitive rules in Redis before committing database changes.
-- Keep the application stateless by storing all runtime counters and cooldowns in Redis instead of Java memory .
+* PostgreSQL stores persistent business data such as posts and comments.
+* Redis manages fast-changing distributed state such as virality scores, bot counters, cooldowns, and pending notifications.
+
+All concurrency-sensitive rules are enforced in Redis **before** database writes.
+This ensures correctness under high load and prevents race conditions.
+
+---
 
 ## Features
 
-- Create a new post
-- Add comments to a post
-- Like a post
-- Calculate virality score in Redis
-- Enforce bot interaction guardrails
-- Batch and summarize bot notifications using Redis and scheduled tasks 
+* Create posts
+* Add comments to posts
+* Like posts
+* Real-time virality scoring using Redis
+* Bot interaction guardrails (horizontal, vertical, cooldown limits)
+* Notification batching and summarization
 
-## Database Schema
-
-The service is based on the following entities:
-- User
-- Bot
-- Post
-- Comment 
-
-PostgreSQL stores the actual content and relationships, while Redis stores temporary operational state required for throttling, counting, and concurrency control .
+---
 
 ## REST Endpoints
 
 ### Create Post
+
 **POST** `/api/posts`
+Creates a new post and returns the created entity.
 
 ### Add Comment
+
 **POST** `/api/posts/{postId}/comments`
+Adds a comment while enforcing depth limits and bot guardrails.
 
 ### Like Post
-**POST** `/api/posts/{postId}/like` 
+
+**POST** `/api/posts/{postId}/like`
+Registers a like and updates the virality score.
+
+---
+
+## Error Handling
+
+* `429 Too Many Requests` → Bot limit or cooldown exceeded
+* `400 Bad Request` → Invalid depth level
+* `404 Not Found` → Invalid post ID
+
+---
 
 ## Redis Virality Engine
 
-Virality score is updated in Redis in real time whenever a user interacts with a post.
+Virality score is updated in Redis in real time for each interaction.
 
 Scoring rules:
-- Bot Reply = +1
-- Human Like = +20
-- Human Comment = +50 
 
-A Redis key such as `post:{id}:virality_score` is incremented based on the interaction type.
+* Bot Reply → +1
+* Human Like → +20
+* Human Comment → +50
+
+Example key:
+
+```
+post:{id}:virality_score
+```
+
+---
 
 ## Atomic Locks and Thread Safety
 
-The assignment requires Redis-based atomic operations to guarantee thread-safe enforcement of Phase 2 guardrails.
+Redis is used as the single source of truth for concurrency control.
 
 ### Horizontal Cap
-A single post cannot receive more than 100 bot replies. This is enforced using a Redis counter such as:
 
-```text
-post:{id}:bot_count
-```
+A post cannot receive more than 100 bot replies.
 
-Before saving a bot comment, the service performs an atomic Redis increment. If the updated counter exceeds 100, the request is rejected with HTTP 429 Too Many Requests and the bot comment is not committed to the database.
+* Redis key: `post:{id}:bot_count`
+* Uses atomic `INCR`
+* If count exceeds 100 → request rejected with `429`
 
 ### Vertical Cap
-A comment thread cannot go deeper than 20 levels. Any request with `depthLevel > 20` is rejected before persistence.
+
+A comment thread cannot exceed depth level 20.
+
+* Requests with `depthLevel > 20` are rejected before persistence
 
 ### Cooldown Cap
-A specific bot cannot interact with the same human more than once in 10 minutes. This is enforced using a Redis TTL key such as:
 
-```text
-cooldown:bot_{id}:human_{id}
-```
+A bot cannot interact with the same human more than once in 10 minutes.
 
-If the cooldown key already exists, the interaction is blocked.
+* Redis key: `cooldown:bot_{id}:human_{id}`
+* Uses TTL-based locking
 
-### How thread safety was guaranteed
-Thread safety was guaranteed by using Redis atomic operations as the gatekeeper for bot interactions instead of Java in-memory state. Since Redis operations such as `INCR` and key existence checks are atomic at the Redis level, concurrent requests cannot bypass the horizontal cap or cooldown logic through race conditions in application memory.
+### Thread Safety Guarantee
 
-This directly addresses the assignment’s spam test, where 200 concurrent requests may attempt to create bot replies at the same time and the system must stop exactly at 100 accepted replies. Database writes are performed only after Redis guardrails pass, which protects data integrity and prevents invalid extra comments from being stored.
+All guardrail checks are enforced using Redis atomic operations **before any database write**.
+Since Redis operations are atomic, concurrent requests cannot bypass limits.
 
-## Statelessness
+This guarantees:
 
-The application is fully stateless as required by the assignment. No `HashMap`, static counters, or in-memory Java collections are used for virality tracking, cooldowns, atomic locks, or pending notifications. All such distributed runtime state is stored in Redis.
+* Exact enforcement of the 100 bot reply cap under concurrent load
+* No race conditions
+* No invalid database writes
+
+---
+
+## Stateless Design
+
+The application is fully stateless.
+
+* No in-memory counters
+* No static variables
+* No local caching for guardrails
+
+All runtime state is stored in Redis.
+
+---
 
 ## Notification Engine
 
-Bot notifications are throttled and batched using Redis.
+Bot notifications are throttled and batched using Redis:
 
-- If a user has not received a bot notification in the last 15 minutes, an immediate notification event is logged and a cooldown key is created.
-- If the user is already inside the cooldown window, the notification is appended to a Redis list such as `user:{id}:pending_notifs`.
+* If user is outside cooldown → immediate notification
+* If inside cooldown → stored in Redis list
+
+Example:
+
+```
+user:{id}:pending_notifs
+```
+
+---
 
 ## Scheduled Sweeper
 
-A Spring `@Scheduled` task runs every 5 minutes for testing and simulates periodic notification batching. It scans users with pending Redis notifications, summarizes them, logs a message such as `Bot X and [N] others interacted with your posts`, and clears the list afterward.
+A scheduled task runs every 5 minutes (for testing):
+
+* Aggregates pending notifications
+* Logs summary:
+
+  ```
+  Bot X and N others interacted with your posts
+  ```
+* Clears processed notifications
+
+---
 
 ## How to Run
 
-### 1. Start PostgreSQL and Redis
+### 1. Start infrastructure
+
 ```bash
 docker-compose up -d
 ```
 
-### 2. Run the Spring Boot application
+### 2. Run the application
+
 ```bash
 mvn spring-boot:run
 ```
 
+### 3. Application will be available at
+
+```
+http://localhost:8080
+```
+
+---
+
+## Postman Collection
+
+* Import: `postman_collection.json`
+* Ensure backend is running on: `http://localhost:8080`
+* Set variable:
+
+  ```
+  base_url = http://localhost:8080
+  ```
+
+### Recommended Execution Order
+
+1. Create Post
+2. Add Comment
+3. Like Post
+
+---
+
 ## Project Structure
 
-```text
-backend-assessment-springboot-redis/
+```
+project-root/
 ├── src/
-│   ├── main/
-│   │   ├── java/
-│   │   └── resources/
-│   └── test/
 ├── docker-compose.yml
 ├── pom.xml
 ├── README.md
-└── Backend_Assessment_Postman_Collection.json
+├── postman_collection.json
 ```
+
+---
 
 ## Repository Contents
 
-This repository contains:
-- The Spring Boot source code
-- `docker-compose.yml` to run PostgreSQL and Redis locally
-- Postman collection JSON for API testing
-- This README explaining the implementation approach and thread safety strategy for Atomic Locks in Phase 2
+* Spring Boot source code
+* `docker-compose.yml` for PostgreSQL and Redis
+* Postman collection for API testing
+* This README explaining system design and thread safety
 
-## Testing Notes
+---
 
-The implementation is intended to satisfy the following assignment scenarios:
-- Concurrent bot reply protection
-- Exact horizontal cap enforcement at 100 bot replies
-- Vertical depth validation
-- Bot-human cooldown enforcement
-- Stateless runtime design
-- PostgreSQL data integrity with Redis gatekeeping
+## Testing Coverage
+
+This implementation satisfies:
+
+* Concurrent bot reply protection
+* Exact horizontal cap enforcement (100 bot replies)
+* Vertical depth validation
+* Bot-human cooldown enforcement
+* Stateless architecture
+* Data integrity using Redis guardrails before DB writes
+
+---
