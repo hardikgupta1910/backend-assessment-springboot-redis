@@ -48,7 +48,6 @@ public class CommentService {
             notificationService.notify(commentRequest.getHumanId(),"Bot "
                     + commentRequest.getAuthorId()+"replied to your post ");
         } else {
-            // Human comment = +50 virality
             redisTemplate.opsForValue()
                     .increment("post:" + postId + ":virality_score", 50);
         }
